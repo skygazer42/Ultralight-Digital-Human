@@ -5,7 +5,11 @@ __pycache__/
 
 # C extensions
 *.so
-
+syncnet_ckpt
+aud_hu.npy
+scrfd_2.5g_kps.onnx
+landmarks/
+full_body_img
 # Distribution / packaging
 .Python
 build/
