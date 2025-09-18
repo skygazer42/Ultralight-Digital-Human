@@ -204,4 +204,15 @@ cython_debug/
 # Marimo
 marimo/_static/
 marimo/_lsp/
+.ipynb_checkpoints
+dataset
+*.wav
+*.npy
+__pycache__
+*.mp4
+checkpoint
+syncnet_checkpoint
+*.jpg
+data_utils/encoder.onnx
+__MACOSX
 __marimo__/
