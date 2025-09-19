@@ -1,6 +1,6 @@
 import argparse
 from os import wait3
-
+#人脸关键点提取脚本。用于从视频帧中检测人脸并提取其关键点（如眼睛、嘴巴、鼻子等的坐标）。
 import numpy as np
 import cv2
 import math

@@ -2,7 +2,7 @@ import cv2
 import time
 import argparse
 import numpy as np
-
+#人脸检测脚本。
 class SCRFD():
     def __init__(self, onnxmodel, confThreshold=0.5, nmsThreshold=0.5):
         self.inpWidth = 640

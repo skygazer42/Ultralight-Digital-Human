@@ -9,14 +9,15 @@ from torch import optim
 import random
 import argparse
 
-#SyncNet训练脚本。用于训练一个音视频同步模型，目的是让生成的口型和音频更匹配，提升真实感。
-
+#SyncNet训练脚本。用于训练一个音视频同步模型，目的是让生成的口型和音频更匹配，提升真实感。理解SyncNet的“使命”
+#因为在训练这个“裁判”的过程中，它内部的两个“专家”——一个图像编码器（看嘴型）和一个音频编码器（听声音）——会被迫学习到嘴型和声音之间的深层对应关系。当这个裁判训练得非常出色时，就意味着这两个编码器已经成了顶级的“唇语专家”和“声音分析专家”。
 class Dataset(object):
     def __init__(self, dataset_dir, mode):
         
         self.img_path_list = []
         self.lms_path_list = []
-        
+#当创建数据集时，它会扫描指定的文件夹，把所有图片 (.jpg) 和关键点 (.lms) 的文件路径都记录在列表里。然后，它会加载我们之前生成的整个音频特征文件 (aud_wenet.npy 或 aud_hu.npy) 到内存中。
+        #这个文件里包含了训练好的音频编码器和图像编码器的权重。这个音频编码器就是我们这次训练的核心产出物。
         for i in range(len(os.listdir(dataset_dir+"/full_body_img/"))):
 
             img_path = os.path.join(dataset_dir+"/full_body_img/", str(i)+".jpg")
@@ -97,7 +98,7 @@ class Dataset(object):
         if self.mode=="hubert":
             audio_feat = audio_feat.reshape(32,32,32)
         y = torch.ones(1).float()
-        
+        #它返回一个三元组：（嘴部图片, 音频片段, 标签y）。这里的标签 y 被硬编码为1，表示我们给模型看的永远是“正确配对”的样本。模型的目标就是让所有这些正确配对的样本得到尽可能高的相似度分数。
         return img_real_T, audio_feat, y
 
 class Conv2d(nn.Module):
@@ -144,7 +145,7 @@ class Conv2dTranspose(nn.Module):
 class SyncNet_color(nn.Module):
     def __init__(self, mode):
         super(SyncNet_color, self).__init__()
-
+#一个图像编码器。它由一堆卷积层 (Conv2d) 组成，专门负责处理输入的“嘴部图片”。
         self.face_encoder = nn.Sequential(
             Conv2d(3, 32, kernel_size=(7, 7), stride=1, padding=3),
 
@@ -174,7 +175,7 @@ class SyncNet_color(nn.Module):
         if mode == "hubert":
             p1 = 32
             p2 = (2, 2)
-        
+        #一个音频编码器。它也由一堆卷积层组成，专门负责处理输入的“音频片段”。
         self.audio_encoder = nn.Sequential(
             Conv2d(p1, 256, kernel_size=3, stride=1, padding=1),
             Conv2d(256, 256, kernel_size=3, stride=1, padding=1, residual=True),
@@ -208,6 +209,7 @@ class SyncNet_color(nn.Module):
         return audio_embedding, face_embedding
 
 logloss = nn.BCELoss()
+#这是核心。它计算音频特征向量 a 和图像特征向量 v 之间的余弦相似度。这个值的范围在-1到1之间，如果两个向量指向完全相同的方向，值就是1，表示“完美匹配”。
 def cosine_loss(a, v, y):
     d = nn.functional.cosine_similarity(a, v)
     loss = logloss(d.unsqueeze(1), y)
@@ -256,3 +258,5 @@ if __name__ == "__main__":
     # audio_embedding, face_embedding = syncnet(img, audio)
     # print(audio_embedding.shape, face_embedding.shape)
     train(opt.save_dir, opt.dataset_dir, opt.asr)
+#就是 syncnet.py 的训练循环。通过 cosine_loss 这个“评分标准”，模型不断地调整自己，直到“学员A”和“学员B”能够为匹配的音视频生成高度相似的报告。
+#学会了“听懂”口型

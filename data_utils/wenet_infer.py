@@ -1,41 +1,49 @@
 import numpy as np
-import yaml
+import yaml #用来读取 .yaml 格式的配置文件。配置文件就像是软件的“设置菜单”，它把一些经常需要修改的参数（比如文件路径、模型大小等）从主代码里分离出来，这样修改设置时就不用动代码，更加方便和安全。在这个脚本里，它会读取 conf/decode_engine_V4.yaml 文件。
 import time
 from collections import defaultdict
 import torch
-from FeaturePipeline import Feature_Pipeline
+from FeaturePipeline import Feature_Pipeline #就是负责将最原始的音频波形，转换成一种叫做“梅尔频谱图”（Mel-spectrogram）的特征。这是音频送入深度学习模型前的标准预处理步骤。
 from wenet.utils.common import (IGNORE_ID, add_sos_eos, log_add,
                                 remove_duplicates_and_blank, th_accuracy,
-                                reverse_pad_list)
+                                reverse_pad_list) #主要用于完整的语音识别任务，比如添加开始/结束符号 (add_sos_eos)、去重等。虽然在这个脚本的最终流程里大部分没用到，但它们是 ASR_Model 类完整功能的一部分
 from torch.nn.utils.rnn import pad_sequence
 import onnxruntime as ort
-
-frames_stride = 67
+#Wenet音频特征提取脚本。和 hubert.py 功能类似，但使用的是Wenet模型。
+frames_stride = 67 #个模型在处理音频特征时，不是一帧一帧地看，而是一次看67帧的一个“小片段”（chunk）。这个数字是由模型本身的结构决定的。
 
 class ASR_Model():
 
     def __init__(self, model_config): #, Feat_Pipeline):
         #with open(model_config_path, 'r') as fin:
         #    self.configs = yaml.load(fin, Loader=yaml.FullLoader)
+        #   # 1. 加载配置和词典
+    #接收从外部传入的配置信息（就是我们用 yaml 库加载的那个），并把它存为自己的一个属性，这样这个“处理器”内部的所有功能都能随时读取设置。
         self.configs = model_config
         self.num2sym_dict = {}
         with open(self.configs['dict_path'], 'r') as fin:
             for line in fin:
                 arr = line.strip().split()
                 assert len(arr) == 2
+                #用这个 num2sym_dict 词典来把它们翻译回人类能看懂的文字（比如  "cat"）。
                 self.num2sym_dict[int(arr[1])] = arr[0]
+        #句子结束
         self.eos = len(self.num2sym_dict) - 1
+        #”和“句子开始”的特殊标记，这在处理序列数据时很常用。
         self.sos = self.eos
         self.ignore_id = IGNORE_ID
         self.reverse_weight = self.configs['reverse_weight']
         self.ctc_weight = self.configs['model_conf']['ctc_weight']
-
+        # 2. 初始化核心组件和状态
+        #它创建了一个 Feature_Pipeline 的实例。从此，我们的 ASR_Model 就拥有了一个强大的子组件 feat_pipeline，专门负责把原始音频波形转换成梅尔频谱图。
         self.feat_pipeline = Feature_Pipeline(self.configs)
+        #因为音频是连续的。当模型在处理音频的第3秒时，它需要记得第1、2秒听到了什么，才能更好地理解上下文
         self.exist_endpoint = False
         #self.num_frames = 0
         self.frames_stride =  frames_stride #self.configs['decoding_chunk_size'] * self.wenet_asr.encoder.embed.subsampling_rate + 3   # frames_stride 输入encoder的大小为[1,1,frames_stride,80]
         #self.right_context = self.wenet_asr.encoder.embed.right_context + 1
         #self.feats_queue = torch.tensor()
+        #一个“特征队列”，用来暂存刚从 feat_pipeline 传过来、还没来得及送入主模型的特征片段。
         self.feats_queue = np.zeros((1,1,80)) #torch.zeros([1,1,80])
         self.offset = torch.ones([1])*100
         self.required_cache_size = self.configs['decoding_chunk_size'] * self.configs['num_decoding_left_chunks']  # 16
@@ -44,6 +52,7 @@ class ASR_Model():
         #self.elayers_output_cache: Optional[List[torch.Tensor]] = None
         #self.conformer_cnn_cache: Optional[List[torch.Tensor]] = None
         self.encoder_out = torch.tensor(0.)
+        #这些是为最终的语音识别（转文字）任务准备的变量，beam_size 和复杂的解码算法有关
         self.result = ''
         #self.hyps = []
         self.cur_hyps = [(tuple(), (0.0, -float('inf')))]
@@ -58,17 +67,19 @@ class ASR_Model():
 
         #self.pun_executor = PunctuationExecutor(model_dir='AddPunctuation/pun_models')
 
-
+#实时音频数据的入口函数 负责接收音频、查询状态以及重置系统，是保证实时处理流程顺利进行的基础。
     def set_input_pipeline(self, waveform_byte):  #num_mel_bins=80, frame_length=25, frame_shift=10, dither=0.0, sample_rate=16000):
+        #目标是接收音频流，并使用 VAD (Voice Activity Detection，语音活动检测) 技术来判断一句话是否说完了（即检测到端点Endpoint）
+        #它会用 feat_pipeline 的判断结果来更新自己的 self.exist_endpoint 状态。这个状态标志非常重要，它告诉处理器：“嘿，一句话已经完整地接收完了，可以准备进行最终识别了！”
         self.exist_endpoint = self.feat_pipeline.AcceptWaveform(waveform_byte)
-    
+    #这是一个查询函数，用来查询当前在 feat_pipeline 的缓冲区里积攒了多长的音频数据还没处理。在实时应用中，这可以用来监控数据流的状态。
     def get_wave_len_in_feat_pipeline(self): 
         return self.feat_pipeline.get_waveform_len()
-
+#当检测到一句话结束（endpoint_detected() 为 True）后，调用这个函数可以从 feat_pipeline 中取出那句完整的话对应的音频数据。
     def get_wav_before_endpoint(self):
         assert self.endpoint_detected() == True
         return self.feat_pipeline.GetFirstWav()
-
+#这是**“重置”或“初始化”**按钮。当一段语音识别任务完全结束，准备开始下一次新的识别时，就必须调用这个函数来清理战场，将所有状态恢复到初始值。
     def init_decoding(self):
         self.exist_endpoint = False
         #self.num_frames = 0
@@ -130,7 +141,7 @@ class ASR_Model():
         hyps = [(y[0], log_add([y[1][0], y[1][1]])) for y in cur_hyps]
         return hyps #, encoder_out
     '''
-
+#这个函数是解码的**“大脑”，它实现了名为束搜索（Beam Search）**的智能算法。它的输入是编码器给出的充满不确定性的概率，输出是它认为最靠谱的文字序列。
     def _chunk_ctc_prefix_beam_search(self, encoder_out): #, cur_hyps): # , encoder_mask):
         '''
         #assert speech.shape[0] == speech_lengths.shape[0]
@@ -207,16 +218,16 @@ class ASR_Model():
         #current_wav_len = self.feat_pipeline.get_waveform_len()
         #if current_wav_len < self.configs['engine_sample_rate_hertz'] * 0.05:
         #    return 
-
+        # 1. 从特征流水线读取一小段新的特征
         feat_read = self.feat_pipeline.ReadFeats() #frames_stride) #ight_context)
         if feat_read==None: 
             return
-        #print('待计算的特征长度：', feat_read.shape)
+        #print('待计算的特征长度：', feat_read.shape)# 2. 将新特征拼接到“待处理”队列中
         if self.feats_queue.shape[1] == 1:
             self.feats_queue = feat_read
         else:
             self.feats_queue = torch.cat((self.feats_queue, feat_read), 1) #[1, frames_stride, 80]
-
+    # 检查原料是否达到“开机”标准 67帧
         encoder_frames = self.frames_stride #+self.right_context
         if self.exist_endpoint == True:
             feat_to_encoder = self.feats_queue
@@ -253,16 +264,17 @@ class ASR_Model():
             #                                       self.conformer_cnn_cache)
             if self.encoder_in_chunk.data_format == F.NC4HW4:
                 self.encoder_in_chunk.reorder(F.NCHW)
+                # 下面这几行是将数据喂给ONNX模型
             self.encoder_in_chunk.write(self.to_numpy(feat_to_encoder.unsqueeze(0)).tolist())
             self.encoder_in_offset.write(self.to_numpy(self.offset).tolist())
             self.encoder_in_att_cache.write(self.to_numpy(self.att_cache).tolist())
             self.encoder_in_cnn_cache.write(self.to_numpy(self.cnn_cache).tolist())
-            
-            y = self.encoder_model['output']
-            #r_att_cache = self.encoder_model['r_att_cache']
+            #获取加工产出，并更新“工作记忆”
+            y = self.encoder_model['output']#是编码器输出的高级声学特征
+            #r_att_cache = self.encoder_model['r_att_cache'] #
             #r_cnn_cache = self.encoder_model['r_cnn_cache']
-            self.att_cache = self.encoder_model['r_att_cache']
-            self.cnn_cache = self.encoder_model['r_cnn_cache']
+            self.att_cache = self.encoder_model['r_att_cache']#更新注意力缓存
+            self.cnn_cache = self.encoder_model['r_cnn_cache']# 更新卷积缓存
 
 
             self.offset += y.shape[1]
@@ -491,12 +503,14 @@ if __name__ == '__main__':
 
 
     import soundfile as sf
-    stream, sample_rate = sf.read(audio_path) # [T*sample_rate,] float64
+    stream, sample_rate = sf.read(audio_path) # [T*sample_rate,] float64 # 如果是双声道，只取第一个声道
     if stream.ndim ==2:
         stream = stream[:, 0]
     # stream = stream[:,0]
+    # 将浮点数波形转换为16位整数格式
     waveform = stream.astype(np.float32)*32767
     waveform = waveform.astype(np.int16)
+    # 在音频前后填充一小段静音它在音频的最前面和最后面都拼接了一小段静音。这是一种常见的技巧，可以给模型一个“缓冲”，帮助它更好地处理语音的开始和结束部分。
     empty_audio_30 = np.zeros([32*160])
     empty_audio_31 = np.zeros([35*160])
     waveform = np.concatenate([empty_audio_30, waveform, empty_audio_31], axis=0)
@@ -525,7 +539,7 @@ if __name__ == '__main__':
     encoder_model_path = "encoder.onnx"
     ort_encoder_session = ort.InferenceSession(encoder_model_path)
 
-
+#从这里开始，代码完全绕过了 ASR_Model 内部那些复杂的 advance_decoding 和 beam_search 函数，而是选择了一条更直接的“手动”处理路径。
     offset = np.ones((1, ), dtype=np.int64)*100
     att_cache = np.zeros([3,8,16,128], dtype=np.float32) #: Optional[torch.Tensor] = None
     cnn_cache = np.zeros([3,1,512,14], dtype=np.float32) #: Optional[torch.Tensor] = None

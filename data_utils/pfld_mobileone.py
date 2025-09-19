@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Module, AvgPool2d, Linear
 from base_module import MobileOneBlock, GhostOneBottleneck, Conv_Block
-
+#一种轻量级人脸关键点检测模型的实现，可能被 get_landmark.py 调用。
 
 class PFLD_GhostOne(Module):
     def __init__(self, width_factor=0.5, input_size=192, landmark_number=110, inference_mode=False):

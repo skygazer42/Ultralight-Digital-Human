@@ -7,7 +7,7 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, List, Tuple
-
+#神经网络的基础模块或基类，被 unet.py 等模型文件引用。
 
 def Conv_Block(in_channel, out_channel, kernel_size, stride, padding, group=1, has_bn=True, is_linear=False):
     return Sequential(
