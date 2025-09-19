@@ -11,7 +11,7 @@ class Landmark:
             raise ImportError("请先: pip install face-alignment") from e
         device = 'cuda' if (use_cuda and torch.cuda.is_available()) else 'cpu'
         self.fa = face_alignment.FaceAlignment(
-            LandmarksType._3D if use_3d else LandmarksType._2D,
+            LandmarksType.THREE_D if use_3d else LandmarksType.TWO_D,
             flip_input=False, device=device
         )
 
