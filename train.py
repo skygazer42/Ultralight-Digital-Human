@@ -10,11 +10,12 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from datasetsss import MyDataset
 from syncnet import SyncNet_color
-from unet_plus import Model
 from unet import Model
 import random
 import torchvision.models as tv_models
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train')
@@ -24,79 +25,51 @@ def get_args():
     parser.add_argument('--save_dir', type=str, required=True)
     parser.add_argument('--see_res', action='store_true')
     parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--batchsize', type=int, default=1)
+    parser.add_argument('--batchsize', type=int, default=64)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--asr', type=str, default="hubert", choices=["hubert", "wenet"])
     parser.add_argument('--weighted_sampling', action='store_true')
-    # 感知损失与SyncNet
+
+    # 感知损失
     parser.add_argument('--perceptual', type=str, default='mobilenetv3',
-                        choices=['vgg', 'resnet', 'mobilenetv3', 'lpips', 'none'],
-                        help=' vgg / resnet / mobilenetv3 / lpips / none')
-    parser.add_argument('--perc_backbone', type=str, default='resnet18',
+                        choices=['vgg', 'resnet', 'mobilenetv3', 'lpips', 'none'])
+    parser.add_argument('--perc_backbone', type=str, default='mbv3_small',
                         choices=['resnet18', 'resnet34', 'resnet50',
                                  'vgg19', 'vgg16',
-                                 'mbv3_large', 'mbv3_small'],
-                        help='perceptual=resnet/vgg/mobilenetv3 backbone')
-    parser.add_argument('--perc_layer', type=str, default='l4',
-                        choices=['l2', 'l3', 'l4', 'c32',  # resnet/vgg
-                                 'mv3_12', 'mv3_16', 'mv3_last'],  # mobilenetv3
-                        help='resnet: l2/l3/l4；vgg: c32；mobilenetv3: mv3_12/mv3_16/mv3_last')
-    parser.add_argument('--sync_w', type=float, default=10.0,
-                        help='SyncNet loss weights se_syncnet')
+                                 'mbv3_large', 'mbv3_small'])
+    parser.add_argument('--perc_layer', type=str, default='mv3_12',
+                        choices=['l2', 'l3', 'l4', 'c32',
+                                 'mv3_12', 'mv3_16', 'mv3_last'])
+    parser.add_argument('--sync_w', type=float, default=10.0)
 
-    # unet_plus
-    parser.add_argument('--width_mult', type=float, default=1.0, help='channel scale：1.0 / 0.75 / 0.6')
-    parser.add_argument('--upsample', type=str, default='nearest', choices=['nearest', 'bilinear'])
-    parser.add_argument('--cross_attn', action='store_true', help='Tiny Cross-Attn')
+    # 新增训练优化参数
+    parser.add_argument('--use_scheduler', action='store_true', help='使用学习率调度')
+    parser.add_argument('--early_stop', type=int, default=60, help='早停耐心值')
+    parser.add_argument('--grad_clip', type=float, default=1.0, help='梯度裁剪')
+    parser.add_argument('--attention_mode', type=str, default='bottleneck',
+                        choices=['none', 'bottleneck', 'all'])
+    parser.add_argument('--dropout', type=float, default=0.1)
+
+    # 损失权重
+    parser.add_argument('--pixel_weight', type=float, default=1.0)
+    parser.add_argument('--perc_weight', type=float, default=0.01)
 
     return parser.parse_args()
+
+
 args = get_args()
-use_syncnet = args.use_syncnet
+
 
 class Perceptual(nn.Module):
-    def __init__(self, kind='resnet', backbone='resnet18', layer='l4'):
+    def __init__(self, kind='mobilenetv3', backbone='mbv3_small', layer='mv3_12'):
         super().__init__()
         self.kind = kind
         self.layer = layer
 
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer('std',  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-        if kind == 'vgg':
-            if backbone == 'vgg16':
-                weights = tv_models.VGG16_Weights.IMAGENET1K_V1
-                vgg = tv_models.vgg16(weights=weights).features
-            else:
-                weights = tv_models.VGG19_Weights.IMAGENET1K_V1
-                vgg = tv_models.vgg19(weights=weights).features
-            cut = 16 if layer == 'c32' else 16
-            self.backbone = nn.Sequential(*[vgg[i] for i in range(cut)]).eval()
-            for p in self.backbone.parameters(): p.requires_grad = False
-            self.crit = nn.MSELoss()
-
-        elif kind == 'resnet':
-            if backbone == 'resnet18':
-                weights = tv_models.ResNet18_Weights.IMAGENET1K_V1
-                resnet = tv_models.resnet18(weights=weights)
-            elif backbone == 'resnet34':
-                weights = tv_models.ResNet34_Weights.IMAGENET1K_V1
-                resnet = tv_models.resnet34(weights=weights)
-            else:
-                weights = tv_models.ResNet50_Weights.IMAGENET1K_V1
-                resnet = tv_models.resnet50(weights=weights)
-            blocks = [
-                resnet.conv1, resnet.bn1, nn.ReLU(inplace=True), resnet.maxpool,
-                resnet.layer1,  # l1
-                resnet.layer2,  # l2
-                resnet.layer3,  # l3
-                resnet.layer4,  # l4
-            ]
-            cut_idx = 6 if layer == 'l2' else (7 if layer == 'l3' else 8)
-            self.backbone = nn.Sequential(*blocks[:cut_idx]).eval()
-            for p in self.backbone.parameters(): p.requires_grad = False
-            self.crit = nn.MSELoss()
-
-        elif kind == 'mobilenetv3':
+        if kind == 'mobilenetv3':
             if backbone == 'mbv3_small':
                 weights = tv_models.MobileNet_V3_Small_Weights.IMAGENET1K_V1
                 mb = tv_models.mobilenet_v3_small(weights=weights)
@@ -108,16 +81,12 @@ class Perceptual(nn.Module):
                 cut = 12
             elif layer == 'mv3_16':
                 cut = 16
-            else:  # 'mv3_last'
+            else:
                 cut = len(feats)
             self.backbone = nn.Sequential(*feats[:cut]).eval()
-            for p in self.backbone.parameters(): p.requires_grad = False
-            self.crit = nn.MSELoss()
-
-        elif kind == 'lpips':
-            import lpips
-            self.backbone = lpips.LPIPS(net='alex').eval()
-            for p in self.backbone.parameters(): p.requires_grad = False
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            self.crit = nn.L1Loss()  # 使用L1损失更稳定
         else:
             self.backbone = None
 
@@ -128,21 +97,18 @@ class Perceptual(nn.Module):
         if self.backbone is None:
             return torch.zeros((), device=x_fake.device)
 
-        if self.kind in ['vgg', 'resnet', 'mobilenetv3']:
-            xf = self._imnet_norm(x_fake)
-            xr = self._imnet_norm(x_real).detach()
-            bb = self.backbone.to(xf.device)
-            return self.crit(bb(xf), bb(xr))
-        else:  # lpips 期望 [-1,1]
-            xf = x_fake * 2 - 1
-            xr = (x_real * 2 - 1).detach()
-            return self.backbone.to(xf.device)(xf, xr).mean()
+        xf = self._imnet_norm(x_fake)
+        xr = self._imnet_norm(x_real).detach()
+        return self.crit(self.backbone(xf), self.backbone(xr))
 
 
 logloss = nn.BCELoss()
+
+
 def cosine_loss(a, v, y):
     d = nn.functional.cosine_similarity(a, v)
     return logloss(d.unsqueeze(1), y)
+
 
 def make_dataloader(dataset_dir, batch_size):
     dataset = MyDataset(dataset_dir, args.asr)
@@ -172,13 +138,16 @@ def make_dataloader(dataset_dir, batch_size):
     )
     return dataset, loader
 
+
 def train(net, epoch, batch_size, lr):
+    # 损失函数
     content_loss = Perceptual(kind=args.perceptual,
                               backbone=args.perc_backbone,
                               layer=args.perc_layer).to(device)
-    if use_syncnet:
+
+    if args.use_syncnet:
         if args.syncnet_checkpoint == "":
-            raise ValueError("Using syncnet, you need to set 'syncnet_checkpoint'. Please check README")
+            raise ValueError("Using syncnet, you need to set 'syncnet_checkpoint'")
         syncnet = SyncNet_color(args.asr).eval().to(device)
         try:
             state = torch.load(args.syncnet_checkpoint, map_location=device, weights_only=True)
@@ -188,19 +157,38 @@ def train(net, epoch, batch_size, lr):
 
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # 数据加载
     dataset_dir_list = [args.dataset_dir]
     dataset_list, dataloader_list = [], []
     for dataset_dir in dataset_dir_list:
         dataset, loader = make_dataloader(dataset_dir, batch_size)
         dataset_list.append(dataset)
         dataloader_list.append(loader)
-    optimizer = optim.Adam(net.parameters(), lr=lr)
+
+    # 优化器
+    optimizer = optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)  # 使用AdamW
     criterion = nn.L1Loss()
+
+    # 学习率调度器
+    scheduler = None
+    if args.use_scheduler:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epoch, eta_min=lr * 0.01
+        )
+
+    # 早停设置
+    best_loss = float('inf')
+    patience_counter = 0
+
+    # 训练循环
     for e in range(epoch):
         net.train()
         random_i = random.randint(0, len(dataset_dir_list) - 1)
         dataset = dataset_list[random_i]
         train_dataloader = dataloader_list[random_i]
+
+        epoch_loss = 0
+        num_batches = 0
 
         with tqdm(total=len(dataset), desc=f'Epoch {e + 1}/{epoch}', unit='img') as p:
             for batch in train_dataloader:
@@ -210,8 +198,10 @@ def train(net, epoch, batch_size, lr):
                 audio_feat = audio_feat.to(device, non_blocking=True)
 
                 preds = net(imgs, audio_feat)
-                # SyncNet
-                if use_syncnet:
+
+                # SyncNet损失
+                sync_loss = 0
+                if args.use_syncnet:
                     if args.asr == "hubert":
                         if audio_feat.shape[1] == 16:
                             audio_feat_sync = torch.cat([audio_feat, audio_feat], dim=1)
@@ -226,24 +216,61 @@ def train(net, epoch, batch_size, lr):
                                 audio_feat_sync = torch.cat([audio_feat, audio_feat[:, :need, :, :]], dim=1)
                     else:
                         audio_feat_sync = audio_feat
+
                     y = torch.ones([preds.shape[0], 1], device=device, dtype=torch.float32)
                     a, v = syncnet(preds, audio_feat_sync)
                     sync_loss = cosine_loss(a, v, y)
 
-                # 损失
+                # 总损失
                 loss_perc = content_loss(preds, labels)
                 loss_pixel = criterion(preds, labels)
-                loss = loss_pixel + 0.01 * loss_perc + (args.sync_w * sync_loss if use_syncnet else 0.0)
 
-                p.set_postfix(**{'loss (batch)': float(loss.item())})
+                loss = (args.pixel_weight * loss_pixel +
+                        args.perc_weight * loss_perc +
+                        (args.sync_w * sync_loss if args.use_syncnet else 0.0))
+
+                p.set_postfix(**{'loss': float(loss.item())})
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+
+                # 梯度裁剪
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
+
                 optimizer.step()
                 p.update(imgs.shape[0])
 
-        if e % 5 == 0:
-            torch.save(net.state_dict(), os.path.join(args.save_dir, f'{e}.pth'))
+                epoch_loss += loss.item()
+                num_batches += 1
 
+        # 平均损失
+        avg_loss = epoch_loss / num_batches if num_batches > 0 else float('inf')
+        print(f"Epoch {e + 1} Average Loss: {avg_loss:.6f}")
+
+        # 学习率调度
+        if scheduler:
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Learning Rate: {current_lr:.6f}")
+
+        # 保存模型
+        if e % 5 == 0:
+            torch.save(net.state_dict(), os.path.join(args.save_dir, f'epoch_{e}.pth'))
+
+        # 最佳模型保存和早停
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            patience_counter = 0
+            torch.save(net.state_dict(), os.path.join(args.save_dir, 'best.pth'))
+            print(f"Best model saved with loss: {best_loss:.6f}")
+        else:
+            patience_counter += 1
+            if args.early_stop > 0 and patience_counter >= args.early_stop:
+                print(f"Early stopping at epoch {e + 1}")
+                break
+
+        # 可视化结果
         if args.see_res:
             net.eval()
             idx = random.randint(0, len(dataset) - 1)
@@ -258,15 +285,18 @@ def train(net, epoch, batch_size, lr):
             cv2.imwrite(f"./train_tmp_img/epoch_{e}.jpg", pred)
             cv2.imwrite(f"./train_tmp_img/epoch_{e}_real.jpg", img_real)
 
+    # 保存最终模型
+    torch.save(net.state_dict(), os.path.join(args.save_dir, 'final.pth'))
+    print(f"Training completed. Best loss: {best_loss:.6f}")
 
 
 if __name__ == '__main__':
-    net = Model(6, args.asr).to(device)
-    # #UNet-Plus
-    # from unet_plus import Model
-    # net = Model(6, args.asr,
-    #             use_cross_attn=args.cross_attn,
-    #             upsample_mode=args.upsample,
-    #             width_mult=args.width_mult).to(device)
+    # 使用优化的模型
+    net = Model(
+        n_channels=6,
+        mode=args.asr,
+        use_attention=args.attention_mode,
+        dropout_rate=args.dropout
+    ).to(device)
 
     train(net, args.epochs, args.batchsize, args.lr)
