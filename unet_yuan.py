@@ -1,5 +1,11 @@
-import time
+import argparse
+import copy
 import math
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -214,70 +220,172 @@ class Model(nn.Module):
         out = F.sigmoid(out)
         return out
 
-if __name__ == '__main__':
-    import time
-    import copy
-    import onnx
-    import numpy as np
-    onnx_path = "./unet.onnx"
+def reparameterize_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return an inference-ready copy of ``model`` when it exposes ``reparameterize``."""
+    model = copy.deepcopy(model)
+    for module in model.modules():
+        if hasattr(module, 'reparameterize'):
+            module.reparameterize()
+    return model
 
-    from thop import profile, clever_format
 
-    def reparameterize_model(model: torch.nn.Module) -> torch.nn.Module:
-        """ Method returns a model where a multi-branched structure
-            used in training is re-parameterized into a single branch
-            for inference.
-        :param model: MobileOne model in train mode.
-        :return: MobileOne model in inference mode.
-        """
-        # Avoid editing original graph
-        model = copy.deepcopy(model)
-        for module in model.modules():
-            if hasattr(module, 'reparameterize'):
-                module.reparameterize()
-        return model
-    device = torch.device("cuda")
-    def check_onnx(torch_out, torch_in, audio):
-        onnx_model = onnx.load(onnx_path)
-        onnx.checker.check_model(onnx_model)
-        import onnxruntime
-        providers = ["CUDAExecutionProvider"]
-        ort_session = onnxruntime.InferenceSession(onnx_path, providers=providers)
-        print(ort_session.get_providers())
-        ort_inputs = {ort_session.get_inputs()[0].name: torch_in.cpu().numpy(), ort_session.get_inputs()[1].name: audio.cpu().numpy()}
-        ort_outs = ort_session.run(None, ort_inputs)
-        np.testing.assert_allclose(torch_out[0].cpu().numpy(), ort_outs[0][0], rtol=1e-03, atol=1e-05)
-        print("Exported model has been tested with ONNXRuntime, and the result looks good!")
-        
-    net = Model(6).eval().to(device)
-    img = torch.zeros([1, 6, 160, 160]).to(device)
-    audio = torch.zeros([1, 16, 32, 32]).to(device)
-    # net = reparameterize_model(net)
-    flops, params = profile(net, (img,audio))
+def _build_export_inputs(device: torch.device, audio_channels: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    img = torch.zeros([1, 6, 160, 160], device=device)
+    audio = torch.zeros([1, audio_channels, 16, 32], device=device)
+    return img, audio
+
+
+def _profile_model(net: torch.nn.Module, img: torch.Tensor, audio: torch.Tensor) -> None:
+    try:
+        from thop import profile, clever_format
+    except ImportError:
+        print("thop not installed; skip FLOPs/params profiling.")
+        return
+
+    flops, params = profile(net, (img, audio))
     macs, params = clever_format([flops, params], "%3f")
     print(macs, params)
-    # dynamic_axes= {'input':[2, 3], 'output':[2, 3]}
-    
-    input_dict = {"input": img, "audio": audio}
-    
+
+
+def _export_to_onnx(net: torch.nn.Module, img: torch.Tensor, audio: torch.Tensor, onnx_path: Path) -> torch.Tensor:
     with torch.no_grad():
         torch_out = net(img, audio)
         print(torch_out.shape)
-        torch.onnx.export(net, (img, audio), onnx_path, input_names=['input', "audio"],
-                        output_names=['output'], 
-                        # dynamic_axes=dynamic_axes,
-                        # example_outputs=torch_out,
-                        opset_version=11,
-                        export_params=True)
-    check_onnx(torch_out, img, audio)
+        torch.onnx.export(
+            net,
+            (img, audio),
+            str(onnx_path),
+            input_names=['input', "audio"],
+            output_names=['output'],
+            opset_version=11,
+            export_params=True,
+        )
+    return torch_out
 
-    # img = torch.zeros([1, 6, 160, 160]).to(device)
-    # audio = torch.zeros([1, 16, 32, 32]).to(device)
-    # with torch.no_grad():
-    #     for i in range(100000):
-    #         t1 = time.time()
-    #         out = net(img, audio)
-    #         t2 = time.time()
-    #         # print(out.shape)
-    #         print('time cost::', t2-t1)
-    # torch.save(net.state_dict(), '1.pth')
+
+def _check_onnx(
+    onnx_path: Path,
+    torch_out: torch.Tensor,
+    torch_in: torch.Tensor,
+    audio: torch.Tensor,
+    providers: List[str],
+) -> None:
+    import numpy as np
+    import onnx
+    import onnxruntime
+
+    onnx_model = onnx.load(str(onnx_path))
+    onnx.checker.check_model(onnx_model)
+    ort_session = onnxruntime.InferenceSession(str(onnx_path), providers=providers)
+    print(ort_session.get_providers())
+    ort_inputs = {
+        ort_session.get_inputs()[0].name: torch_in.cpu().numpy(),
+        ort_session.get_inputs()[1].name: audio.cpu().numpy(),
+    }
+    ort_outs = ort_session.run(None, ort_inputs)
+    np.testing.assert_allclose(
+        torch_out[0].cpu().numpy(),
+        ort_outs[0][0],
+        rtol=1e-03,
+        atol=1e-05,
+    )
+    print("Exported model has been tested with ONNXRuntime, and the result looks good!")
+
+
+def _convert_to_mnn(
+    onnx_path: Path,
+    mnn_path: Path,
+    converter: str = "MNNConvert",
+    biz_code: str = "MNN",
+    extra_args: Optional[List[str]] = None,
+) -> None:
+    if shutil.which(converter) is None:
+        raise FileNotFoundError(
+            f"Cannot find '{converter}'. Install MNN or provide an explicit path via --mnn-converter."
+        )
+
+    cmd = [
+        converter,
+        "-f",
+        "ONNX",
+        "--modelFile",
+        str(onnx_path),
+        "--MNNModel",
+        str(mnn_path),
+        "--bizCode",
+        biz_code,
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+
+    print(f"Running {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+
+
+def _resolve_device(device_str: str) -> torch.device:
+    if device_str.startswith("cuda") and not torch.cuda.is_available():
+        print("CUDA not available; falling back to CPU for export.")
+        return torch.device("cpu")
+    return torch.device(device_str)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Export Ultralight Digital Human model to ONNX/MNN.")
+    parser.add_argument("--onnx-path", default="./unet.onnx", help="Output path for the ONNX model.")
+    parser.add_argument("--mnn-path", default="./unet.mnn", help="Output path for the MNN model when exporting.")
+    parser.add_argument("--export-mnn", action="store_true", help="Trigger ONNX->MNN conversion after export.")
+    parser.add_argument("--mnn-converter", default="MNNConvert", help="MNN converter executable or full path.")
+    parser.add_argument("--biz-code", default="MNN", help="BizCode argument passed to MNNConvert.")
+    parser.add_argument("--device", default="cuda", help="Torch device used during export (e.g., cuda or cpu).")
+    parser.add_argument(
+        "--audio-channels",
+        type=int,
+        default=128,
+        help="Audio tensor channel count. Use 128 for wenet and 16 for hubert mode.",
+    )
+    parser.add_argument(
+        "--providers",
+        default="CPUExecutionProvider",
+        help="Comma separated ONNXRuntime providers for validation.",
+    )
+    parser.add_argument("--skip-profile", action="store_true", help="Skip FLOPs/params profiling step.")
+    parser.add_argument("--skip-onnx-check", action="store_true", help="Skip ONNXRuntime validation step.")
+    parser.add_argument(
+        "--mnn-extra-args",
+        nargs="*",
+        default=None,
+        help="Extra arguments passed to MNNConvert.",
+    )
+    args = parser.parse_args()
+
+    onnx_path = Path(args.onnx_path)
+    device = _resolve_device(args.device)
+
+    net = Model(6).eval().to(device)
+    img, audio = _build_export_inputs(device, args.audio_channels)
+
+    if not args.skip_profile:
+        _profile_model(net, img, audio)
+
+    torch_out = _export_to_onnx(net, img, audio, onnx_path)
+
+    if not args.skip_onnx_check:
+        providers = [p.strip() for p in args.providers.split(',') if p.strip()]
+        if not providers:
+            providers = ["CPUExecutionProvider"]
+        _check_onnx(onnx_path, torch_out, img, audio, providers)
+
+    if args.export_mnn:
+        mnn_path = Path(args.mnn_path)
+        _convert_to_mnn(
+            onnx_path,
+            mnn_path,
+            converter=args.mnn_converter,
+            biz_code=args.biz_code,
+            extra_args=args.mnn_extra_args,
+        )
+        print(f"MNN model written to {mnn_path}")
+
+
+if __name__ == '__main__':
+    main()

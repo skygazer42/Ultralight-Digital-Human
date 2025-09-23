@@ -7,13 +7,21 @@
 
 import asyncio
 import argparse
+import base64
+import contextlib
 import json
 import logging
 import os
+import shutil
+import subprocess
+import tempfile
 import time
-from typing import Optional
+import wave
 from collections import deque
+from pathlib import Path
+from typing import Optional
 
+import cv2
 import numpy as np
 from aiohttp import web
 
@@ -37,6 +45,152 @@ from dihuman_run import DiHumanProcessor
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_filename(name: str, suffix: str = ".mp4") -> str:
+    """Remove path separators and ensure the file has the desired suffix."""
+    if not name:
+        name = f"synth_{int(time.time())}"
+    name = name.replace("\\", "_").replace("/", "_").strip()
+    if not name.lower().endswith(suffix):
+        name = f"{name}{suffix}"
+    return name
+
+
+def _load_wav_file(path: Path) -> tuple[np.ndarray, int]:
+    """Load a 16-bit PCM WAV file and return mono samples with sample rate."""
+    if not path.exists():
+        raise FileNotFoundError(f"Audio file not found: {path}")
+
+    with contextlib.closing(wave.open(str(path), "rb")) as wf:
+        sample_width = wf.getsampwidth()
+        if sample_width != 2:
+            raise ValueError("Only 16-bit PCM WAV is supported")
+        channels = wf.getnchannels()
+        sample_rate = wf.getframerate()
+        frames = wf.getnframes()
+        audio_bytes = wf.readframes(frames)
+
+    audio = np.frombuffer(audio_bytes, dtype=np.int16)
+    if channels > 1:
+        audio = audio.reshape(-1, channels).astype(np.float32)
+        audio = np.mean(audio, axis=1)
+        audio = np.clip(audio, -32768, 32767).astype(np.int16)
+    return audio, sample_rate
+
+
+def _synthesize_tts_to_wav(text: str, output_path: Path) -> None:
+    try:
+        import pyttsx3  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "pyttsx3 is required for text-to-speech. Install it with 'pip install pyttsx3'."
+        ) from exc
+
+    engine = pyttsx3.init()
+    engine.save_to_file(text, str(output_path))
+    engine.runAndWait()
+    engine.stop()
+
+
+def _run_offline_synthesis(
+    audio_16k: np.ndarray,
+    data_path: Path,
+    fps: int,
+    work_dir: Path,
+) -> dict:
+    """Generate talking-head video from 16kHz mono audio samples."""
+    processor = DiHumanProcessor(str(data_path))
+
+    frames = []
+    audio_chunks = []
+    chunk_size = 160  # 10ms @ 16kHz
+
+    total_samples = int(audio_16k.shape[0])
+    for start in range(0, total_samples, chunk_size):
+        chunk = audio_16k[start:start + chunk_size]
+        if chunk.shape[0] < chunk_size:
+            chunk = np.pad(chunk, (0, chunk_size - chunk.shape[0]))
+
+        img, playing_audio, check_img = processor.process(chunk)
+
+        if playing_audio is not None and playing_audio.size:
+            audio_chunks.append(playing_audio.copy())
+
+        if check_img and img is not None:
+            frames.append(img.copy())
+
+    # Flush remaining audio/playback buffers with silence
+    for _ in range(50):
+        if getattr(processor, "audio_play_list", None) == []:
+            break
+        img, playing_audio, check_img = processor.process(np.zeros(chunk_size, dtype=np.int16))
+        if playing_audio is not None and playing_audio.size:
+            audio_chunks.append(playing_audio.copy())
+        if check_img and img is not None:
+            frames.append(img.copy())
+
+    if not frames:
+        raise RuntimeError("No video frames were produced. Ensure the models and data_path are correct.")
+
+    height, width = frames[0].shape[:2]
+    video_path = work_dir / "synth_video.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError("Failed to open video writer. Check OpenCV codecs support.")
+
+    try:
+        for frame in frames:
+            if frame.shape[:2] != (height, width):
+                frame = cv2.resize(frame, (width, height))
+            writer.write(frame)
+    finally:
+        writer.release()
+
+    if audio_chunks:
+        audio_out = np.concatenate(audio_chunks).astype(np.int16)
+    else:
+        audio_out = np.zeros(chunk_size, dtype=np.int16)
+
+    audio_path = work_dir / "synth_audio.wav"
+    with contextlib.closing(wave.open(str(audio_path), "wb")) as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(audio_out.tobytes())
+
+    muxed_path = None
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin:
+        muxed_path = work_dir / "synth_output.mp4"
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(audio_path),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(muxed_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as exc:  # pragma: no cover - diagnostics only
+            muxed_path = None
+            logger.warning("ffmpeg mux failed: %s", exc.stderr.decode(errors="ignore")[:500])
+    else:  # pragma: no cover - environment dependent
+        logger.warning("ffmpeg not found; returning separate audio/video files.")
+
+    return {
+        "video_path": video_path,
+        "audio_path": audio_path,
+        "muxed_path": muxed_path,
+    }
 
 
 class AudioResampler:
@@ -279,7 +433,7 @@ async def offer(request):
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     # 获取配置
-    data_path = request.app["data_path"]
+    data_path: Path = request.app["data_path"]
     fps = request.app["fps"]
 
     # 创建连接
@@ -287,7 +441,7 @@ async def offer(request):
     peer_connections.add(pc)
 
     # 为每个连接创建独立的处理器
-    processor = DiHumanProcessor(data_path)
+    processor = DiHumanProcessor(str(data_path))
     bridge = ProcessorBridge(processor, fps)
     await bridge.start()
 
@@ -356,6 +510,112 @@ async def offer(request):
     )
 
 
+async def synthesize(request):
+    """离线合成接口: 接收文本或音频, 输出数字人视频"""
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"status": "error", "message": "Invalid JSON payload"}, status=400)
+
+    text = payload.get("text")
+    audio_b64 = payload.get("audio_base64")
+    audio_path_param = payload.get("audio_path")
+
+    provided_inputs = [bool(text), bool(audio_b64), bool(audio_path_param)]
+    if sum(provided_inputs) != 1:
+        return web.json_response(
+            {
+                "status": "error",
+                "message": "Provide exactly one of 'text', 'audio_base64', or 'audio_path'."
+            },
+            status=400,
+        )
+
+    output_name = payload.get("output_name", "")
+    app = request.app
+    data_path: Path = app["data_path"]
+    fps: int = app["fps"]
+    output_dir: Path = app["output_dir"]
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="dihuman_tmp_"))
+    loop = asyncio.get_running_loop()
+
+    try:
+        source_wav_path: Path
+
+        if text:
+            source_wav_path = temp_dir / "tts.wav"
+            try:
+                await loop.run_in_executor(None, _synthesize_tts_to_wav, text, source_wav_path)
+            except RuntimeError as exc:
+                return web.json_response({"status": "error", "message": str(exc)}, status=400)
+        elif audio_b64:
+            try:
+                audio_bytes = base64.b64decode(audio_b64)
+            except Exception:
+                return web.json_response({"status": "error", "message": "audio_base64 is invalid"}, status=400)
+            source_wav_path = temp_dir / "upload.wav"
+            source_wav_path.write_bytes(audio_bytes)
+        else:
+            source_wav_path = Path(audio_path_param)
+            if not source_wav_path.exists():
+                return web.json_response(
+                    {"status": "error", "message": f"audio_path not found: {source_wav_path}"},
+                    status=404,
+                )
+
+        try:
+            audio_samples, sample_rate = await loop.run_in_executor(None, _load_wav_file, source_wav_path)
+        except Exception as exc:
+            return web.json_response({"status": "error", "message": str(exc)}, status=400)
+
+        if audio_samples.size == 0:
+            return web.json_response({"status": "error", "message": "Audio file is empty"}, status=400)
+
+        audio_16k = AudioResampler.resample_to_16k(audio_samples, sample_rate)
+
+        result = await loop.run_in_executor(
+            None,
+            _run_offline_synthesis,
+            audio_16k,
+            data_path,
+            fps,
+            temp_dir,
+        )
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sanitized_name = _sanitize_filename(output_name)
+
+        response_payload = {"status": "ok"}
+
+        if result["muxed_path"] is not None:
+            final_video = output_dir / sanitized_name
+            shutil.move(str(result["muxed_path"]), final_video)
+            response_payload["video"] = str(final_video)
+        else:
+            final_video = output_dir / sanitized_name
+            shutil.move(str(result["video_path"]), final_video)
+            audio_name = f"{Path(sanitized_name).stem}.wav"
+            final_audio = output_dir / audio_name
+            shutil.move(str(result["audio_path"]), final_audio)
+            response_payload.update(
+                {
+                    "video": str(final_video),
+                    "audio": str(final_audio),
+                    "message": "ffmpeg not available; returned separate audio and video.",
+                }
+            )
+
+        return web.json_response(response_payload)
+
+    except Exception as exc:
+        logger.exception("Synthesis failed")
+        return web.json_response({"status": "error", "message": str(exc)}, status=500)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 async def on_shutdown(app):
     """关闭所有连接"""
     coros = [pc.close() for pc in peer_connections]
@@ -373,25 +633,30 @@ def main():
     args = parser.parse_args()
 
     # 验证数据路径
-    if not os.path.exists(args.data_path):
-        print(f"错误: 数据路径不存在: {args.data_path}")
+    data_path = Path(args.data_path)
+    if not data_path.exists():
+        print(f"错误: 数据路径不存在: {data_path}")
         return
 
     # 创建应用
     app = web.Application()
-    app["data_path"] = args.data_path
+    app["data_path"] = data_path
     app["fps"] = args.fps
+    output_dir = data_path / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    app["output_dir"] = output_dir
 
     # 配置路由
     app.router.add_get("/", index)
     app.router.add_post("/offer", offer)
+    app.router.add_post("/synthesize", synthesize)
 
     # 配置关闭处理
     app.on_shutdown.append(on_shutdown)
 
     # 启动服务
     logger.info(f"启动服务: http://{args.host}:{args.port}")
-    logger.info(f"数据路径: {args.data_path}")
+    logger.info(f"数据路径: {data_path}")
     logger.info(f"视频帧率: {args.fps} FPS")
 
     web.run_app(app, host=args.host, port=args.port)
