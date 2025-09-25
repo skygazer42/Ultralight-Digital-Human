@@ -4,7 +4,21 @@ import argparse
 import numpy as np
 import subprocess
 import sys
+from pathlib import Path
 #数据预处理主脚本。这是数据准备的入口，它会自动调用其他脚本来完成视频抽帧、人脸检测、关键点提取、音频提取和特征提取等一系列操作。
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+
+
+def _build_env_with_root():
+    env = os.environ.copy()
+    root = str(ROOT_DIR)
+    current = env.get('PYTHONPATH', '')
+    parts = [p for p in current.split(os.pathsep) if p]
+    if root not in parts:
+        parts.insert(0, root)
+    env['PYTHONPATH'] = os.pathsep.join(parts) if parts else root
+    return env
 
 #提取音频这个函数的功能非常专一，就是把视频文件中的声音“剥离”出来，存成一个独立的 .wav 音频文件。
 def extract_audio(path, out_path, sample_rate=16000):
@@ -44,9 +58,9 @@ def get_audio_feature(wav_path, mode):
     print("extracting audio feature...")
     
     if mode == "wenet":
-        subprocess.run([sys.executable, "-m", "data_utils.wenet_infer", wav_path], check=True)
+        subprocess.run([sys.executable, "-m", "data_utils.wenet_infer", wav_path], check=True, env=_build_env_with_root())
     if mode == "hubert":
-        subprocess.run([sys.executable, "-m", "data_utils.hubert", "--wav", wav_path], check=True)
+        subprocess.run([sys.executable, "-m", "data_utils.hubert", "--wav", wav_path], check=True, env=_build_env_with_root())
     #遍历刚刚提取出来的每一张图片，在图片上找到人脸，并精确定位出眼睛、眉毛、鼻子、嘴巴等部位的68个或更多关键点的坐标。这些点就是“landmarks”。它们是驱动数字人表情和口型的核心数据。
 # def get_landmark(path, landmarks_dir):
 #     print("detecting landmarks...")
@@ -69,7 +83,7 @@ def get_audio_feature(wav_path, mode):
 #                 f.write(str(y))
 #                 f.write("\n")
 
-def get_landmark(path, landmarks_dir, provider='pfld', fa_cpu=False):
+def get_landmark(path, landmarks_dir, provider='fa', fa_cpu=False):
     print(f"detecting landmarks with provider={provider} ...")
     full_img_dir = path.replace(path.split("/")[-1], "full_body_img")
     if provider == 'pfld':
