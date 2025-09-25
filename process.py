@@ -2,14 +2,18 @@ import os
 import cv2
 import argparse
 import numpy as np
+import subprocess
+import sys
 #数据预处理主脚本。这是数据准备的入口，它会自动调用其他脚本来完成视频抽帧、人脸检测、关键点提取、音频提取和特征提取等一系列操作。
 
 #提取音频这个函数的功能非常专一，就是把视频文件中的声音“剥离”出来，存成一个独立的 .wav 音频文件。
 def extract_audio(path, out_path, sample_rate=16000):
      #代表 audio rate，设置音频的采样率为16000Hz。为什么是16000？ 因为AI模型在训练时听的音频都是这个标准，所以我们必须把新的音频也统一成这个标准，模型才能“听懂”。
     print(f'[INFO] ===== extract audio from {path} to {out_path} =====')
-    cmd = f'ffmpeg -i {path} -f wav -ar {sample_rate} {out_path}'
-    os.system(cmd)
+    cmd = [
+        'ffmpeg', '-y', '-i', path, '-f', 'wav', '-ac', '1', '-ar', str(sample_rate), out_path
+    ]
+    subprocess.run(cmd, check=True)
     print(f'[INFO] ===== extracted audio =====')
    #extract_images提取图像帧把视频像播放幻灯片一样，一帧一帧地拆开，并把每一帧都存成一张独立的 .jpg 图片。
 def extract_images(path, mode):
@@ -40,9 +44,9 @@ def get_audio_feature(wav_path, mode):
     print("extracting audio feature...")
     
     if mode == "wenet":
-        os.system("python wenet_infer.py "+wav_path)
+        subprocess.run([sys.executable, "-m", "data_utils.wenet_infer", wav_path], check=True)
     if mode == "hubert":
-        os.system("python hubert.py --wav "+wav_path)
+        subprocess.run([sys.executable, "-m", "data_utils.hubert", "--wav", wav_path], check=True)
     #遍历刚刚提取出来的每一张图片，在图片上找到人脸，并精确定位出眼睛、眉毛、鼻子、嘴巴等部位的68个或更多关键点的坐标。这些点就是“landmarks”。它们是驱动数字人表情和口型的核心数据。
 # def get_landmark(path, landmarks_dir):
 #     print("detecting landmarks...")

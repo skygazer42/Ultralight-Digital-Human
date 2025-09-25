@@ -38,6 +38,8 @@ def main():
         # Hubert：UNet 用16通道，SyncNet习惯32通道，这里补到 32
         if args.asr == "hubert" and audio.shape[1] == 16:
             audio = torch.cat([audio, audio], dim=1)
+        elif args.asr == "wenet" and audio.shape[1] == 128:
+            audio = torch.cat([audio, audio], dim=1)
         audio = audio.to(device)
         a, v = net(img, audio)
         sim = torch.nn.functional.cosine_similarity(a, v).mean().clamp(-1,1).item()
