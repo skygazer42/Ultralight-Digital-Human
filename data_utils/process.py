@@ -40,8 +40,8 @@ def extract_images(path, mode):
     counter = 0
     cap = cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    if mode == "hubert" and fps != 25:
-        raise ValueError("Using hubert,your video fps should be 25!!!")
+    if mode in ("hubert", "ave") and fps != 25:
+        raise ValueError("Using hubert/ave, your video fps should be 25!!!")
     if mode == "wenet" and fps != 20:
         raise ValueError("Using wenet,your video fps should be 20!!!")
         
@@ -61,6 +61,9 @@ def get_audio_feature(wav_path, mode):
         subprocess.run([sys.executable, "-m", "data_utils.wenet_infer", wav_path], check=True, env=_build_env_with_root())
     if mode == "hubert":
         subprocess.run([sys.executable, "-m", "data_utils.hubert", "--wav", wav_path], check=True, env=_build_env_with_root())
+    if mode == "ave":
+        subprocess.run([sys.executable, "-m", "data_utils.ave.test_w2l_audio", "--wav_path", wav_path], check=True, env=_build_env_with_root())
+
     #遍历刚刚提取出来的每一张图片，在图片上找到人脸，并精确定位出眼睛、眉毛、鼻子、嘴巴等部位的68个或更多关键点的坐标。这些点就是“landmarks”。它们是驱动数字人表情和口型的核心数据。
 # def get_landmark(path, landmarks_dir):
 #     print("detecting landmarks...")
@@ -111,7 +114,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str, help="path to video file")
-    parser.add_argument('--asr', type=str, default='hubert', help="wenet or hubert")
+    parser.add_argument('--asr', type=str, default='hubert', help="wenet | hubert | ave")
     opt = parser.parse_args()
     asr_mode = opt.asr
 
