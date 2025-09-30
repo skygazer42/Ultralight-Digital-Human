@@ -213,7 +213,6 @@ dataset
 *.wav
 *.npy
 __pycache__
-*.mp4
 checkpoint
 syncnet_checkpoint
 *.jpg
