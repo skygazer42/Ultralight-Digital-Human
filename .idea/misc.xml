@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="$USER_HOME$/ENTER" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="MuseTalk" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="$USER_HOME$/ENTER/envs/dh" project-jdk-type="Python SDK" />
 </project>

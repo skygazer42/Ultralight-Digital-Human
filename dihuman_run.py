@@ -63,7 +63,7 @@ class DiHumanProcessor:
 
         # 放一定量的空音频
         self.audio_play_list = [0]*13440
-        providers = ["CUDAExecutionProvider"]
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.ort_unet_session = onnxruntime.InferenceSession(os.path.join(data_path, "unet.onnx"), providers=providers)
         self.ort_ae_session = onnxruntime.InferenceSession(os.path.join(data_path, "encoder.onnx"), providers=providers)
         # 输入到ae的音频，前面的310ms全是0

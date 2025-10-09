@@ -44,8 +44,9 @@ from dihuman_run import DiHumanProcessor as WenetProcessor
 
 if TYPE_CHECKING:
     from dihuman_run_hubert import DiHumanProcessorHubert
+    from dihuman_run_ave import DiHumanProcessorAve
 
-ProcessorType = Union[WenetProcessor, "DiHumanProcessorHubert"]
+ProcessorType = Union[WenetProcessor, "DiHumanProcessorHubert", "DiHumanProcessorAve"]
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -105,6 +106,10 @@ def _create_processor(asr_mode: str, data_path: Path) -> ProcessorType:
         logger.info("Loading HuBERT processor")
         from dihuman_run_hubert import DiHumanProcessorHubert  # delayed import
         return DiHumanProcessorHubert(str(data_path))
+    if mode == "ave":
+        logger.info("Loading AVE processor")
+        from dihuman_run_ave import DiHumanProcessorAve  # delayed import
+        return DiHumanProcessorAve(str(data_path))
     if mode == "wenet":
         return WenetProcessor(str(data_path))
     raise ValueError(f"Unsupported ASR mode: {asr_mode}")
@@ -650,7 +655,7 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="服务器地址")
     parser.add_argument("--port", type=int, default=8080, help="服务器端口")
     parser.add_argument("--fps", type=int, default=25, choices=[20, 25], help="视频帧率")
-    parser.add_argument("--asr", choices=["wenet", "hubert"], default="wenet", help="音频分支模式")
+    parser.add_argument("--asr", choices=["wenet", "hubert", "ave"], default="wenet", help="音频分支模式")
 
     args = parser.parse_args()
 
