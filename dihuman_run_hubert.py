@@ -14,6 +14,7 @@ import onnxruntime
 import torch
 from transformers import HubertModel, Wav2Vec2Processor
 
+from smooth_filter import LandmarkSmoother
 
 logger = logging.getLogger(__name__)
 
@@ -34,17 +35,32 @@ def _make_even_first_dim(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _create_soft_mask(shape, inner_ratio=0.7):
+    h, w = shape[:2]
+    mask = np.zeros((h, w), dtype=np.float32)
+    center = (w // 2, h // 2)
+    axes = (int(w * inner_ratio / 2), int(h * inner_ratio / 2))
+    cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (21, 21), 0)
+    return mask
+
+
 class DiHumanProcessorHubert:
     """HuBERT-based processor mirroring the Wenet streaming API."""
 
-    def __init__(self, data_path: str):
+    def __init__(self, data_path: str, fps: int = 25, use_smooth: bool = False, use_soft_mask: bool = False, use_seamless: bool = False):
         self.data_path = data_path
+        self.fps = fps
+        self.use_smooth = use_smooth
+        self.use_soft_mask = use_soft_mask
+        self.use_seamless = use_seamless
 
         self.full_body_img_dir = os.path.join(data_path, "img_inference")
         self.lms_dir = os.path.join(data_path, "lms_inference")
 
         self.full_body_img_list: List[np.ndarray] = []
         self.bbox_list: List[List[int]] = []
+        self.landmarks_list: List[np.ndarray] = []
         for i in range(max(0, len(os.listdir(self.lms_dir)) - 1)):
             full_body_img = cv2.imread(os.path.join(self.full_body_img_dir, f"{i}.jpg"))
             if full_body_img is None:
@@ -58,11 +74,18 @@ class DiHumanProcessorHubert:
                         continue
                     lms_list.append(np.array(line.split(" "), dtype=np.float32))
             lms = np.array(lms_list, dtype=np.float32)
+            self.landmarks_list.append(lms)
             xmin, ymin, xmax, ymax = compute_mouth_roi(lms, full_body_img.shape)
             self.bbox_list.append([xmin, ymin, xmax, ymax])
 
         if not self.full_body_img_list or not self.bbox_list:
             raise RuntimeError("Missing inference images or landmarks under data_path.")
+
+        self.num_points = int(self.landmarks_list[0].shape[0])
+        self.smoother = (
+            LandmarkSmoother(num_points=self.num_points, fps=self.fps)
+            if self.use_smooth else None
+        )
 
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.ort_unet_session = onnxruntime.InferenceSession(
@@ -96,6 +119,8 @@ class DiHumanProcessorHubert:
         self.audio_play_list = [0] * 13440
         self.counter = 0
         self.is_processing = True
+        if self.use_smooth:
+            self.smoother = LandmarkSmoother(num_points=self.num_points, fps=self.fps)
 
     def _compute_hubert_features(self, waveform: np.ndarray) -> np.ndarray:
         if waveform.size == 0:
@@ -128,6 +153,16 @@ class DiHumanProcessorHubert:
             self.sample_buffer = self.sample_buffer[-self.overlap_samples :]
         else:
             self.sample_buffer = np.zeros((0,), dtype=np.float32)
+
+    def _compute_bbox(self, frame_idx: int, img: np.ndarray) -> List[int]:
+        frame_idx = max(0, min(frame_idx, len(self.landmarks_list) - 1))
+        landmarks = self.landmarks_list[frame_idx]
+        if self.use_smooth and self.smoother is not None:
+            landmarks = self.smoother.smooth(landmarks.astype(np.float32))
+        xmin, ymin, xmax, ymax = compute_mouth_roi(landmarks, img.shape)
+        bbox = [int(xmin), int(ymin), int(xmax), int(ymax)]
+        self.bbox_list[frame_idx] = bbox
+        return bbox
 
     def process(self, audio_frame: np.ndarray) -> Tuple[Optional[np.ndarray], np.ndarray, int]:
         audio_frame = audio_frame.astype(np.int16)
@@ -180,7 +215,7 @@ class DiHumanProcessorHubert:
 
         if self.feature_window.shape[0] >= self.frames_per_window:
             img = self.full_body_img_list[self.index].copy()
-            bbox = self.bbox_list[self.index]
+            bbox = self._compute_bbox(self.index, img)
             self.index += self.step
             if self.index >= len(self.bbox_list) - 1:
                 self.step = -1
@@ -192,10 +227,11 @@ class DiHumanProcessorHubert:
             h, w = crop_img.shape[:2]
             crop_img = cv2.resize(crop_img, (168, 168))
             crop_img_ori = crop_img.copy()
+            roi_original = img[ymin:ymax, xmin:xmax].copy()
 
             img_real_ex = crop_img[4:164, 4:164].copy()
             img_real_ex_ori = img_real_ex.copy()
-            img_masked = cv2.rectangle(img_real_ex.copy(), (5, 5), (150, 145), (0, 0, 0), -1)
+            img_masked = cv2.rectangle(img_real_ex.copy(), (5, 5, 150, 145), (0, 0, 0), -1)
 
             img_masked = img_masked.transpose(2, 0, 1).astype(np.float32) / 255.0
             img_real_ex = img_real_ex.transpose(2, 0, 1).astype(np.float32) / 255.0
@@ -215,9 +251,35 @@ class DiHumanProcessorHubert:
             pred = pred.transpose(1, 2, 0) * 255.0
             pred = pred.astype(np.uint8)
 
+            if self.use_soft_mask:
+                soft_mask = _create_soft_mask(pred.shape)
+                pred = (pred.astype(np.float32) * soft_mask[..., None] +
+                        img_real_ex_ori.astype(np.float32) * (1 - soft_mask[..., None])).astype(np.uint8)
+
             crop_img_ori[4:164, 4:164] = pred
             crop_img_ori = cv2.resize(crop_img_ori, (w, h))
-            img[ymin:ymax, xmin:xmax] = crop_img_ori
+
+            if self.use_seamless:
+                try:
+                    mask = np.ones((h, w), dtype=np.uint8) * 255
+                    center = (xmin + w // 2, ymin + h // 2)
+                    img = cv2.seamlessClone(crop_img_ori, img, mask, center, cv2.NORMAL_CLONE)
+                except Exception:
+                    if self.use_soft_mask:
+                        crop_mask = _create_soft_mask((h, w), inner_ratio=0.9)[..., None]
+                        blend = (crop_img_ori.astype(np.float32) * crop_mask +
+                                 roi_original.astype(np.float32) * (1 - crop_mask))
+                        img[ymin:ymax, xmin:xmax] = blend.astype(np.uint8)
+                    else:
+                        img[ymin:ymax, xmin:xmax] = crop_img_ori
+            else:
+                if self.use_soft_mask:
+                    crop_mask = _create_soft_mask((h, w), inner_ratio=0.9)[..., None]
+                    blend = (crop_img_ori.astype(np.float32) * crop_mask +
+                             roi_original.astype(np.float32) * (1 - crop_mask))
+                    img[ymin:ymax, xmin:xmax] = blend.astype(np.uint8)
+                else:
+                    img[ymin:ymax, xmin:xmax] = crop_img_ori
 
             self.feature_window = self.feature_window[1:]
 

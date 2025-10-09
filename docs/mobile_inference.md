@@ -5,6 +5,7 @@
 1. 导出并校验 ONNX 模型  
 2. 可选：转换为 MNN 模型  
 3. 在移动端接入模型，并实现与仓库推理脚本一致的前/后处理
+4. （实时可选）导出音频编码器并在端侧完成特征提取
 
 ---
 
@@ -100,9 +101,29 @@ MNNConvert \
 
 ---
 
-## 5. 手机端集成示例
+## 5. 导出 AVE 音频编码器（实时场景）
 
-### 5.1 ONNX Runtime（Android，Kotlin 示例）
+若在移动端实时捕获音频并直接输入 UNet（如 AVE 模式），除了导出 UNet 之外，还需要将音频编码器转换为 ONNX/MNN。仓库提供脚本 `tools/export_audio_encoder.py`：
+
+```bash
+python tools/export_audio_encoder.py \
+  --checkpoint model/checkpoints/audio_visual_encoder.pth \
+  --output export/audio_encoder.onnx
+
+MNNConvert \
+  -f ONNX \
+  --modelFile export/audio_encoder.onnx \
+  --MNNModel export/audio_encoder.mnn \
+  --bizCode UltralightDH
+```
+
+导出的 `audio_encoder.mnn` 接收形状 `[1, 1, 80, 16]` 的 Mel-Spectrogram，输出 512 维音频特征。端侧需复现 `DiHumanProcessorAve` 的 Mel 计算：`n_fft=800`，`hop=200`，`num_mels=80`，并按照 `FUTURE_CONTEXT=8` 组装 `[1, 32, 16, 16]` 输入 UNet。
+
+---
+
+## 6. 手机端集成示例
+
+### 6.1 ONNX Runtime（Android，Kotlin 示例）
 
 ```kotlin
 val options = SessionOptions().apply { setExecutionMode(ExecutionMode.ORT_SEQUENTIAL) }
@@ -120,7 +141,7 @@ val output = results.first().value as Array<FloatArray>
 - 使用 [onnxruntime-mobile](https://onnxruntime.ai/docs/build/ios-and-android/) 版本可以显著减小包体  
 - 推荐将 `unet_hubert.onnx` 放入 `app/src/main/assets`，并在打包前使用 `onnxruntime-tools` 做裁剪
 
-### 5.2 MNN（C++，Android/iOS 通用）
+### 6.2 MNN（C++，Android/iOS 通用）
 
 ```cpp
 MNN::Interpreter* net = MNN::Interpreter::createFromFile("unet_hubert.mnn");
@@ -148,7 +169,7 @@ auto output = net->getSessionOutput(session, "output");
 
 ---
 
-## 6. 常见问题与调试建议
+## 7. 常见问题与调试建议
 
 - **导出失败**：确认 `torch`, `onnx`, `onnxruntime`, `numpy` 版本兼容；若显存不足，可在 CPU 上导出  
 - **精度下降**：检查前处理是否与 `inference.py` 完全一致；验证时建议先在 PC 上对比 PyTorch、ONNX、MNN 输出  

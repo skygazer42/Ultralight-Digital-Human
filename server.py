@@ -99,19 +99,45 @@ def _synthesize_tts_to_wav(text: str, output_path: Path) -> None:
     engine.stop()
 
 
-def _create_processor(asr_mode: str, data_path: Path) -> ProcessorType:
+def _create_processor(
+    asr_mode: str,
+    data_path: Path,
+    fps: int,
+    *,
+    use_smooth: bool,
+    use_soft_mask: bool,
+    use_seamless: bool,
+) -> ProcessorType:
     """Instantiate the requested audio front-end."""
     mode = asr_mode.lower()
     if mode == "hubert":
         logger.info("Loading HuBERT processor")
         from dihuman_run_hubert import DiHumanProcessorHubert  # delayed import
-        return DiHumanProcessorHubert(str(data_path))
+        return DiHumanProcessorHubert(
+            str(data_path),
+            fps=fps,
+            use_smooth=use_smooth,
+            use_soft_mask=use_soft_mask,
+            use_seamless=use_seamless,
+        )
     if mode == "ave":
         logger.info("Loading AVE processor")
         from dihuman_run_ave import DiHumanProcessorAve  # delayed import
-        return DiHumanProcessorAve(str(data_path))
+        return DiHumanProcessorAve(
+            str(data_path),
+            fps=fps,
+            use_smooth=use_smooth,
+            use_soft_mask=use_soft_mask,
+            use_seamless=use_seamless,
+        )
     if mode == "wenet":
-        return WenetProcessor(str(data_path))
+        return WenetProcessor(
+            str(data_path),
+            fps=fps,
+            use_smooth=use_smooth,
+            use_soft_mask=use_soft_mask,
+            use_seamless=use_seamless,
+        )
     raise ValueError(f"Unsupported ASR mode: {asr_mode}")
 
 
@@ -121,9 +147,10 @@ def _run_offline_synthesis(
     fps: int,
     work_dir: Path,
     asr_mode: str,
+    processor_opts: dict,
 ) -> dict:
     """Generate talking-head video from 16kHz mono audio samples."""
-    processor = _create_processor(asr_mode, data_path)
+    processor = _create_processor(asr_mode, data_path, fps, **processor_opts)
 
     frames = []
     audio_chunks = []
@@ -459,13 +486,14 @@ async def offer(request):
     data_path: Path = request.app["data_path"]
     fps = request.app["fps"]
     asr_mode = request.app["asr_mode"]
+    processor_opts = request.app["processor_opts"]
 
     # 创建连接
     pc = RTCPeerConnection()
     peer_connections.add(pc)
 
     # 为每个连接创建独立的处理器
-    processor = _create_processor(asr_mode, data_path)
+    processor = _create_processor(asr_mode, data_path, fps, **processor_opts)
     bridge = ProcessorBridge(processor, fps)
     await bridge.start()
 
@@ -562,6 +590,7 @@ async def synthesize(request):
     fps: int = app["fps"]
     output_dir: Path = app["output_dir"]
     asr_mode: str = app["asr_mode"]
+    processor_opts: dict = app["processor_opts"]
 
     temp_dir = Path(tempfile.mkdtemp(prefix="dihuman_tmp_"))
     loop = asyncio.get_running_loop()
@@ -608,6 +637,7 @@ async def synthesize(request):
             fps,
             temp_dir,
             asr_mode,
+            processor_opts,
         )
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -656,6 +686,9 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="服务器端口")
     parser.add_argument("--fps", type=int, default=25, choices=[20, 25], help="视频帧率")
     parser.add_argument("--asr", choices=["wenet", "hubert", "ave"], default="wenet", help="音频分支模式")
+    parser.add_argument("--use-smooth", action="store_true", help="启用关键点平滑")
+    parser.add_argument("--use-soft-mask", action="store_true", help="启用软边缘融合")
+    parser.add_argument("--use-seamless", action="store_true", help="启用 seamlessClone 融合")
 
     args = parser.parse_args()
 
@@ -673,6 +706,11 @@ def main():
     output_dir = data_path / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     app["output_dir"] = output_dir
+    app["processor_opts"] = {
+        "use_smooth": args.use_smooth,
+        "use_soft_mask": args.use_soft_mask,
+        "use_seamless": args.use_seamless,
+    }
 
     # 配置路由
     app.router.add_get("/", index)
@@ -687,6 +725,21 @@ def main():
     logger.info(f"数据路径: {data_path}")
     logger.info(f"视频帧率: {args.fps} FPS")
     logger.info(f"音频模式: {args.asr}")
+    if args.use_smooth or args.use_soft_mask or args.use_seamless:
+        logger.info(
+            "启用增强: %s",
+            ", ".join(
+                [
+                    opt
+                    for opt, enabled in {
+                        "smooth": args.use_smooth,
+                        "soft_mask": args.use_soft_mask,
+                        "seamless": args.use_seamless,
+                    }.items()
+                    if enabled
+                ]
+            ),
+        )
 
     web.run_app(app, host=args.host, port=args.port)
 

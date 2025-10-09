@@ -12,6 +12,7 @@ import onnxruntime
 import torch
 
 from mouth_roi import compute_mouth_roi
+from smooth_filter import LandmarkSmoother
 from data_utils.ave import audio as ave_audio
 from data_utils.ave.models.audioEnc import AudioEncoder
 
@@ -26,16 +27,31 @@ FPS = 25
 FUTURE_CONTEXT = 8  # frames on each side used to build UNet audio tensor
 
 
+def _create_soft_mask(shape, inner_ratio=0.7):
+    h, w = shape[:2]
+    mask = np.zeros((h, w), dtype=np.float32)
+    center = (w // 2, h // 2)
+    axes = (int(w * inner_ratio / 2), int(h * inner_ratio / 2))
+    cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (21, 21), 0)
+    return mask
+
+
 class DiHumanProcessorAve:
     """Streaming processor using the AVE audio encoder and 328 UNet."""
 
-    def __init__(self, data_path: str):
+    def __init__(self, data_path: str, fps: int = FPS, use_smooth: bool = False, use_soft_mask: bool = False, use_seamless: bool = False):
         self.data_path = data_path
+        self.fps = fps
+        self.use_smooth = use_smooth
+        self.use_soft_mask = use_soft_mask
+        self.use_seamless = use_seamless
         self.full_body_img_dir = os.path.join(data_path, "img_inference")
         self.lms_dir = os.path.join(data_path, "lms_inference")
 
         self.full_body_img_list: List[np.ndarray] = []
         self.bbox_list: List[List[int]] = []
+        self.landmarks_list: List[np.ndarray] = []
         for i in range(max(0, len(os.listdir(self.lms_dir)) - 1)):
             full_body_img = cv2.imread(os.path.join(self.full_body_img_dir, f"{i}.jpg"))
             if full_body_img is None:
@@ -49,11 +65,18 @@ class DiHumanProcessorAve:
                         continue
                     lms_list.append(np.array(line.split(" "), dtype=np.float32))
             lms = np.array(lms_list, dtype=np.float32)
+            self.landmarks_list.append(lms)
             xmin, ymin, xmax, ymax = compute_mouth_roi(lms, full_body_img.shape)
             self.bbox_list.append([xmin, ymin, xmax, ymax])
 
         if not self.full_body_img_list or not self.bbox_list:
             raise RuntimeError("Missing inference images or landmarks under data_path.")
+
+        self.num_points = int(self.landmarks_list[0].shape[0])
+        self.smoother = (
+            LandmarkSmoother(num_points=self.num_points, fps=self.fps)
+            if self.use_smooth else None
+        )
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -102,6 +125,8 @@ class DiHumanProcessorAve:
         self.audio_play_list = [0] * 13440
         self.counter = 0
         self.is_processing = True
+        if self.use_smooth:
+            self.smoother = LandmarkSmoother(num_points=self.num_points, fps=self.fps)
 
     def _append_feature(self, feature: np.ndarray) -> None:
         feature = feature.astype(np.float32)
@@ -128,7 +153,7 @@ class DiHumanProcessorAve:
 
     def _render_frame(self, audio_tensor: np.ndarray) -> np.ndarray:
         img = self.full_body_img_list[self.index].copy()
-        bbox = self.bbox_list[self.index]
+        bbox = self._compute_bbox(self.index, img)
 
         self.index += self.step
         if self.index >= len(self.bbox_list) - 1:
@@ -144,8 +169,10 @@ class DiHumanProcessorAve:
         crop_h, crop_w = crop_img.shape[:2]
         crop_img = cv2.resize(crop_img, (328, 328), interpolation=cv2.INTER_CUBIC)
         crop_img_ori = crop_img.copy()
+        roi_original = img[ymin:ymax, xmin:xmax].copy()
         img_real_ex = crop_img[4:324, 4:324].copy()
-        img_masked = cv2.rectangle(img_real_ex.copy(), (5, 5), (310, 305), (0, 0, 0), -1)
+        img_real_ex_ori = img_real_ex.copy()
+        img_masked = cv2.rectangle(img_real_ex.copy(), (5, 5, 310, 305), (0, 0, 0), -1)
 
         img_real_ex = (img_real_ex.transpose(2, 0, 1) / 255.0).astype(np.float32)
         img_masked = (img_masked.transpose(2, 0, 1) / 255.0).astype(np.float32)
@@ -159,9 +186,35 @@ class DiHumanProcessorAve:
         pred = ort_outs[0][0].transpose(1, 2, 0) * 255.0
         pred = pred.astype(np.uint8)
 
+        if self.use_soft_mask:
+            soft_mask = _create_soft_mask(pred.shape)
+            pred = (pred.astype(np.float32) * soft_mask[..., None] +
+                    img_real_ex_ori.astype(np.float32) * (1 - soft_mask[..., None])).astype(np.uint8)
+
         crop_img_ori[4:324, 4:324] = pred
         crop_img_ori = cv2.resize(crop_img_ori, (crop_w, crop_h), interpolation=cv2.INTER_CUBIC)
-        img[ymin:ymax, xmin:xmax] = crop_img_ori
+
+        if self.use_seamless:
+            try:
+                mask = np.ones((crop_h, crop_w), dtype=np.uint8) * 255
+                center = (xmin + crop_w // 2, ymin + crop_h // 2)
+                img = cv2.seamlessClone(crop_img_ori, img, mask, center, cv2.NORMAL_CLONE)
+            except Exception:
+                if self.use_soft_mask:
+                    crop_mask = _create_soft_mask((crop_h, crop_w), inner_ratio=0.9)[..., None]
+                    blend = (crop_img_ori.astype(np.float32) * crop_mask +
+                             roi_original.astype(np.float32) * (1 - crop_mask))
+                    img[ymin:ymax, xmin:xmax] = blend.astype(np.uint8)
+                else:
+                    img[ymin:ymax, xmin:xmax] = crop_img_ori
+        else:
+            if self.use_soft_mask:
+                crop_mask = _create_soft_mask((crop_h, crop_w), inner_ratio=0.9)[..., None]
+                blend = (crop_img_ori.astype(np.float32) * crop_mask +
+                         roi_original.astype(np.float32) * (1 - crop_mask))
+                img[ymin:ymax, xmin:xmax] = blend.astype(np.uint8)
+            else:
+                img[ymin:ymax, xmin:xmax] = crop_img_ori
         return img
 
     def _update_audio_features(self) -> None:
@@ -194,6 +247,16 @@ class DiHumanProcessorAve:
 
             self._append_feature(feature)
             self.frame_cursor += 1
+
+    def _compute_bbox(self, frame_idx: int, img: np.ndarray) -> List[int]:
+        frame_idx = max(0, min(frame_idx, len(self.landmarks_list) - 1))
+        landmarks = self.landmarks_list[frame_idx]
+        if self.use_smooth and self.smoother is not None:
+            landmarks = self.smoother.smooth(landmarks.astype(np.float32))
+        xmin, ymin, xmax, ymax = compute_mouth_roi(landmarks, img.shape)
+        bbox = [int(xmin), int(ymin), int(xmax), int(ymax)]
+        self.bbox_list[frame_idx] = bbox
+        return bbox
 
     def process(self, audio_frame: np.ndarray) -> Tuple[Optional[np.ndarray], np.ndarray, int]:
         audio_frame = audio_frame.astype(np.int16)
