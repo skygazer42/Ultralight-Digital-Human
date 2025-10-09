@@ -176,6 +176,8 @@ export PYTHONPATH=/usr/lib/python3.10/dist-packages:$PYTHONPATH
 ---
 
 ## 参考文档
+- `example/web/`：WebRTC 浏览器实时演示（与 `server.py` 搭配）
+- `example/trt/`：TensorRT 引擎构建与推理脚本
 - `docs/mobile_inference.md`：手机端 ONNX/MNN 部署指南
 - `docs/cpp_example.md`：C++ ONNX Runtime 推理示例
 - `docs/onnxrt_service.md`：HTTP 推理服务说明

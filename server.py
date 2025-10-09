@@ -30,6 +30,20 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
 from aiortc.contrib.media import MediaRecorder
 import av
 
+
+def _resolve_client_html() -> Path:
+    """Locate client.html file for the web demo."""
+    candidates = [
+        Path(__file__).with_name("client.html"),
+        Path(__file__).parent / "example" / "web" / "client.html",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "无法找到 client.html，请确保其位于仓库根目录或 example/web/ 下。"
+    )
+
 # 音频处理
 try:
     from scipy.signal import resample_poly
@@ -473,7 +487,8 @@ peer_connections = set()
 
 async def index(request):
     """返回客户端HTML页面"""
-    content = open('client.html', 'r', encoding='utf-8').read()
+    client_html_path = _resolve_client_html()
+    content = client_html_path.read_text(encoding="utf-8")
     return web.Response(text=content, content_type='text/html')
 
 
