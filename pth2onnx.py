@@ -9,12 +9,22 @@ import numpy as np
 import onnx
 import torch
 
-from unet import Model
 
+IMG_SHAPES: Dict[str, Tuple[int, int, int, int]] = {
+    "base": (1, 6, 160, 160),
+    "328": (1, 6, 320, 320),
+}
 
-AUDIO_SHAPES: Dict[str, Tuple[int, int, int, int]] = {
-    "wenet": (1, 128, 16, 32),
-    "hubert": (1, 16, 32, 32),
+AUDIO_SHAPES: Dict[str, Dict[str, Tuple[int, int, int, int]]] = {
+    "base": {
+        "hubert": (1, 16, 32, 32),
+        "wenet": (1, 128, 16, 32),
+    },
+    "328": {
+        "hubert": (1, 32, 32, 32),
+        "wenet": (1, 256, 16, 32),
+        "ave": (1, 32, 16, 16),
+    },
 }
 
 
@@ -25,8 +35,14 @@ def parse_args() -> argparse.Namespace:
         "--output", type=Path, default=Path("unet.onnx"), help="Destination path for the exported ONNX file"
     )
     parser.add_argument(
+        "--variant",
+        choices=sorted(IMG_SHAPES.keys()),
+        default="base",
+        help="Model variant used during training (base=160px UNet, 328=larger UNet)",
+    )
+    parser.add_argument(
         "--asr",
-        choices=sorted(AUDIO_SHAPES.keys()),
+        choices=sorted({mode for variants in AUDIO_SHAPES.values() for mode in variants}),
         default="wenet",
         help="Audio branch used during training (must match the checkpoint)",
     )
@@ -72,11 +88,21 @@ def check_onnx(torch_out: torch.Tensor, torch_img: torch.Tensor, torch_audio: to
 def main() -> None:
     args = parse_args()
 
-    if args.asr not in AUDIO_SHAPES:
-        raise ValueError(f"Unsupported ASR mode: {args.asr}")
+    if args.variant not in IMG_SHAPES:
+        raise ValueError(f"Unsupported model variant: {args.variant}")
 
-    audio_shape = AUDIO_SHAPES[args.asr]
-    img_shape = (1, 6, 160, 160)
+    variant_audio_shapes = AUDIO_SHAPES.get(args.variant, {})
+    if args.asr not in variant_audio_shapes:
+        supported = ", ".join(sorted(variant_audio_shapes))
+        raise ValueError(f"Variant '{args.variant}' does not support ASR '{args.asr}'. Supported: {supported}")
+
+    audio_shape = variant_audio_shapes[args.asr]
+    img_shape = IMG_SHAPES[args.variant]
+
+    if args.variant == "328":
+        from unet_328 import Model
+    else:
+        from unet import Model
 
     model = Model(n_channels=img_shape[1], mode=args.asr).eval()
     load_state_dict(model, args.checkpoint)
