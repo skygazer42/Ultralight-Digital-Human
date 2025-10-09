@@ -103,18 +103,15 @@ MNNConvert \
 
 ## 5. 导出 AVE 音频编码器（实时场景）
 
-若在移动端实时捕获音频并直接输入 UNet（如 AVE 模式），除了导出 UNet 之外，还需要将音频编码器转换为 ONNX/MNN。仓库提供脚本 `tools/export_audio_encoder.py`：
+若在移动端实时捕获音频并直接输入 UNet（如 AVE 模式），除了导出 UNet 之外，还需要将音频编码器转换为 ONNX/MNN。仓库提供脚本 `tools/export_models.py`：
 
 ```bash
-python tools/export_audio_encoder.py \
+python tools/export_models.py \
+  --component audio_encoder \
   --checkpoint model/checkpoints/audio_visual_encoder.pth \
-  --output export/audio_encoder.onnx
-
-MNNConvert \
-  -f ONNX \
-  --modelFile export/audio_encoder.onnx \
-  --MNNModel export/audio_encoder.mnn \
-  --bizCode UltralightDH
+  --onnx export/audio_encoder.onnx \
+  --mnn export/audio_encoder.mnn \
+  --mnnconvert /path/to/MNNConvert
 ```
 
 导出的 `audio_encoder.mnn` 接收形状 `[1, 1, 80, 16]` 的 Mel-Spectrogram，输出 512 维音频特征。端侧需复现 `DiHumanProcessorAve` 的 Mel 计算：`n_fft=800`，`hop=200`，`num_mels=80`，并按照 `FUTURE_CONTEXT=8` 组装 `[1, 32, 16, 16]` 输入 UNet。

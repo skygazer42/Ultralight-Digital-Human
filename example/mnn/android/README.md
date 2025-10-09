@@ -168,15 +168,15 @@ private fun startStreaming() {
 
 ## 6. 下一步
 
-1. **音频编码器导出**：使用 `tools/export_audio_encoder.py` 将 `model/checkpoints/audio_visual_encoder.pth` 导出为 `audio_encoder.onnx`，再通过 `MNNConvert` 生成 `audio_encoder.mnn`：
+1. **音频编码器导出**：使用统一脚本 `tools/export_models.py` 将 `model/checkpoints/audio_visual_encoder.pth` 导出并转换：
 
    ```bash
-   python tools/export_audio_encoder.py \
+   python tools/export_models.py \
+     --component audio_encoder \
      --checkpoint model/checkpoints/audio_visual_encoder.pth \
-     --output audio_encoder.onnx
-
-   MNNConvert -f ONNX --modelFile audio_encoder.onnx \
-     --MNNModel audio_encoder.mnn
+     --onnx audio_encoder.onnx \
+     --mnn audio_encoder.mnn \
+     --mnnconvert /path/to/MNNConvert
    ```
 
 2. **关键点与 ROI**：示例默认使用 assets 中的离线数据，实际项目需集成人脸检测/关键点模型（可在 JNI 层实现）以对接摄像头帧。
