@@ -35,18 +35,56 @@ except ImportError:  # Fallback for environments without top-level utils module
         return auds
 
 
+def create_soft_mask(shape, inner_ratio=0.7, kernel_size=21) -> np.ndarray:
+    """
+    Build a soft-edged elliptical mask favouring the centre of the crop.
+
+    Parameters
+    ----------
+    shape:
+        2D or 3D array shape. Only the first two dimensions (H, W) are used.
+    inner_ratio:
+        Fraction of width/height kept at full intensity before tapering.
+    kernel_size:
+        Gaussian blur kernel size to smooth the ellipse boundary.
+    """
+    h, w = shape[:2]
+    if h == 0 or w == 0:
+        return np.zeros((h, w), dtype=np.float32)
+
+    mask = np.zeros((h, w), dtype=np.float32)
+    center = (w // 2, h // 2)
+    axes = (
+        max(1, int(w * inner_ratio / 2)),
+        max(1, int(h * inner_ratio / 2)),
+    )
+    cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
+
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    blur_size = min(kernel_size, max(3, (min(h, w) // 2) * 2 + 1))
+    if blur_size % 2 == 0:
+        blur_size += 1
+    mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+    return np.clip(mask, 0.0, 1.0)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Inference (328 variant)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument('--asr', type=str, default='ave', choices=['hubert', 'wenet', 'ave'])
+    #• - --name 要填的是人物或项目的标识，它必须同时对应两个目录：./dataset/<name>里的数据集，以及 ./checkpoint/<name> 下的模型权重文件。
+  # - 举例：如果你的数据放在 ./dataset/May、checkpoint 放在 ./checkpoint/May，就写 --name May。这样程序会去这两个位置读数据并推理输出。
     parser.add_argument('--name', type=str, default='May')
     parser.add_argument('--audio_path', type=str, default='demo/talk_hb.wav')
     parser.add_argument('--start_frame', type=int, default=0)
     parser.add_argument('--parsing', action='store_true', help='Use semantic parsing masks during compositing.')
     parser.add_argument('--use_smooth', action='store_true', help='Apply landmark smoothing before cropping mouth ROI.')
     parser.add_argument('--smooth_fps', type=int, default=0, help='Optional FPS override for the smoother (0 keeps mode default).')
+    parser.add_argument('--use_soft_mask', action='store_true', help='Blend generated crops with a soft-edged mask.')
+    parser.add_argument('--use_seamless', action='store_true', help='Use cv2.seamlessClone for final compositing.')
     return parser
 
 
@@ -200,6 +238,12 @@ def main() -> None:
             pred = net(img_concat_T, audio_feat)[0]
 
         pred = (pred.cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+        if args.use_soft_mask:
+            soft_mask = create_soft_mask(pred.shape[:2])[..., None]
+            pred = (
+                pred.astype(np.float32) * soft_mask +
+                img_real_ex_ori.astype(np.float32) * (1.0 - soft_mask)
+            ).astype(np.uint8)
         crop_img_ori[4:324, 4:324] = pred
         crop_img_ori = cv2.resize(crop_img_ori, (crop_w, crop_h), interpolation=cv2.INTER_CUBIC)
 
@@ -210,7 +254,24 @@ def main() -> None:
             )
             crop_img_ori[parsing_mask] = crop_img_par[parsing_mask]
 
-        img[ymin:ymax, xmin:xmax] = crop_img_ori
+        if args.use_seamless:
+            try:
+                mask = np.ones((crop_h, crop_w), dtype=np.uint8) * 255
+                center = (xmin + crop_w // 2, ymin + crop_h // 2)
+                img = cv2.seamlessClone(crop_img_ori, img, mask, center, cv2.NORMAL_CLONE)
+            except cv2.error:
+                img[ymin:ymax, xmin:xmax] = crop_img_ori
+        else:
+            if args.use_soft_mask:
+                blend_mask = create_soft_mask((crop_h, crop_w), inner_ratio=0.9)[..., None]
+                target_region = img[ymin:ymax, xmin:xmax].astype(np.float32)
+                blended = (
+                    crop_img_ori.astype(np.float32) * blend_mask +
+                    target_region * (1.0 - blend_mask)
+                ).astype(np.uint8)
+                img[ymin:ymax, xmin:xmax] = blended
+            else:
+                img[ymin:ymax, xmin:xmax] = crop_img_ori
         video_writer.write(img)
 
     video_writer.release()
