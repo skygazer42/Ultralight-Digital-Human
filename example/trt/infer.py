@@ -13,7 +13,10 @@ import numpy as np
 
 try:
     import tensorrt as trt
-    from cuda import cudart
+    try:
+        from cuda import cudart  # type: ignore
+    except ImportError:  # cuda-python >= 13 moved symbols under cuda.bindings
+        from cuda.bindings import runtime as cudart  # type: ignore
 except ImportError:  # pragma: no cover - optional dependencies
     trt = None
     cudart = None
@@ -214,4 +217,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
